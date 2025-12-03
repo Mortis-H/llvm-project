@@ -36,6 +36,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -117,8 +118,6 @@ public:
       return "protected";
     case MCSA_Reference:
       return "reference";
-    case MCSA_IndirectReference:
-      return "indirect_reference";
     case MCSA_Extern:
       return "extern";
     case MCSA_Weak:
@@ -141,6 +140,102 @@ public:
     llvm_unreachable("Unhandled symbol attribute");
   }
 
+  static void printExpr(const MCExpr *Expr, raw_ostream &OS) {
+    auto PrintBinaryOpcode = [](MCBinaryExpr::Opcode Op) {
+      switch (Op) {
+      case MCBinaryExpr::Add:
+        return "+";
+      case MCBinaryExpr::And:
+        return "&";
+      case MCBinaryExpr::Div:
+        return "/";
+      case MCBinaryExpr::EQ:
+        return "==";
+      case MCBinaryExpr::GT:
+        return ">";
+      case MCBinaryExpr::GTE:
+        return ">=";
+      case MCBinaryExpr::LAnd:
+        return "&&";
+      case MCBinaryExpr::LOr:
+        return "||";
+      case MCBinaryExpr::LT:
+        return "<";
+      case MCBinaryExpr::LTE:
+        return "<=";
+      case MCBinaryExpr::Mod:
+        return "%";
+      case MCBinaryExpr::Mul:
+        return "*";
+      case MCBinaryExpr::NE:
+        return "!=";
+      case MCBinaryExpr::Or:
+        return "|";
+      case MCBinaryExpr::OrNot:
+        return "|~";
+      case MCBinaryExpr::Shl:
+        return "<<";
+      case MCBinaryExpr::AShr:
+        return ">>";
+      case MCBinaryExpr::LShr:
+        return ">>>";
+      case MCBinaryExpr::Sub:
+        return "-";
+      case MCBinaryExpr::Xor:
+        return "^";
+      }
+      return "?";
+    };
+
+    switch (Expr->getKind()) {
+    case MCExpr::Constant:
+      OS << cast<MCConstantExpr>(Expr)->getValue();
+      return;
+    case MCExpr::SymbolRef: {
+      const auto *Sym = cast<MCSymbolRefExpr>(Expr);
+      if (Sym->getSpecifier())
+        OS << "spec" << Sym->getSpecifier() << '(';
+      OS << Sym->getSymbol().getName();
+      if (Sym->getSpecifier())
+        OS << ')';
+      return;
+    }
+    case MCExpr::Unary: {
+      const auto *Unary = cast<MCUnaryExpr>(Expr);
+      switch (Unary->getOpcode()) {
+      case MCUnaryExpr::LNot:
+        OS << '!';
+        break;
+      case MCUnaryExpr::Minus:
+        OS << '-';
+        break;
+      case MCUnaryExpr::Not:
+        OS << '~';
+        break;
+      case MCUnaryExpr::Plus:
+        OS << '+';
+        break;
+      }
+      printExpr(Unary->getSubExpr(), OS);
+      return;
+    }
+    case MCExpr::Binary: {
+      const auto *Bin = cast<MCBinaryExpr>(Expr);
+      printExpr(Bin->getLHS(), OS);
+      OS << ' ' << PrintBinaryOpcode(Bin->getOpcode()) << ' ';
+      printExpr(Bin->getRHS(), OS);
+      return;
+    }
+    case MCExpr::Specifier:
+      OS << "<specifier_expr>";
+      return;
+    case MCExpr::Target:
+      OS << "<target_expr>";
+      return;
+    }
+    OS << "<expr>";
+  }
+
   void emitRawTextImpl(StringRef String) override {
     OS << "DIRECTIVE: " << String << '\n';
   }
@@ -155,7 +250,7 @@ public:
 
   void emitAssignment(MCSymbol *Symbol, const MCExpr *Value) override {
     OS << "ASSIGNMENT: " << Symbol->getName() << " = ";
-    Value->print(OS, &MAI);
+    printExpr(Value, OS);
     OS << '\n';
     MCStreamer::emitAssignment(Symbol, Value);
   }
@@ -176,13 +271,65 @@ public:
   bool emitSymbolAttribute(MCSymbol *Symbol, MCSymbolAttr Attribute) override {
     OS << "SYMBOL_ATTR: " << Symbol->getName()
        << " attr=" << describeAttr(Attribute) << '\n';
-    return true;
+    return MCStreamer::emitSymbolAttribute(Symbol, Attribute);
   }
 
   void emitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                         Align ByteAlignment) override {
     OS << "COMMON: " << Symbol->getName() << " size=" << Size;
     OS << " align=" << ByteAlignment.value() << '\n';
+    MCStreamer::emitCommonSymbol(Symbol, Size, ByteAlignment);
+  }
+
+  void emitLocalCommonSymbol(MCSymbol *Symbol, uint64_t Size,
+                             Align ByteAlignment) override {
+    OS << "LOCAL_COMMON: " << Symbol->getName() << " size=" << Size;
+    OS << " align=" << ByteAlignment.value() << '\n';
+    MCStreamer::emitLocalCommonSymbol(Symbol, Size, ByteAlignment);
+  }
+
+  void emitELFSize(MCSymbol *Symbol, const MCExpr *Value) override {
+    OS << "SIZE: " << Symbol->getName() << " = ";
+    printExpr(Value, OS);
+    OS << '\n';
+    MCStreamer::emitELFSize(Symbol, Value);
+  }
+
+  void emitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) override {
+    OS << "DATA: size=" << Size << " expr=";
+    printExpr(Value, OS);
+    OS << '\n';
+    MCStreamer::emitValueImpl(Value, Size, Loc);
+  }
+
+  void emitBytes(StringRef Data) override {
+    OS << "DATA_BYTES: size=" << Data.size() << " values=" << toHex(Data)
+       << '\n';
+    MCStreamer::emitBytes(Data);
+  }
+
+  void emitFill(const MCExpr &NumBytes, uint64_t Value, SMLoc Loc) override {
+    OS << "FILL: count=";
+    printExpr(&NumBytes, OS);
+    OS << " value=" << Value << '\n';
+    MCStreamer::emitFill(NumBytes, Value, Loc);
+  }
+
+  void emitFill(const MCExpr &NumValues, int64_t Size, int64_t Expr,
+                SMLoc Loc) override {
+    OS << "FILL: count=";
+    printExpr(&NumValues, OS);
+    OS << " size=" << Size << " value=" << Expr << '\n';
+    MCStreamer::emitFill(NumValues, Size, Expr, Loc);
+  }
+
+  void emitValueToAlignment(Align Alignment, int64_t Value, uint8_t ValueSize,
+                            unsigned MaxBytesToEmit) override {
+    OS << "ALIGN: to=" << Alignment.value() << " fill=" << Value
+       << " size=" << static_cast<unsigned>(ValueSize)
+       << " max=" << MaxBytesToEmit << '\n';
+    MCStreamer::emitValueToAlignment(Alignment, Value, ValueSize,
+                                     MaxBytesToEmit);
   }
 
   void emitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) override {
