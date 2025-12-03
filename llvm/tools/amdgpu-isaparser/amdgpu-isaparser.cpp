@@ -16,14 +16,17 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCAsmInfo.h"
-#include "llvm/MC/MCAsmParser.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCTargetOptions.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CommandLine.h"
@@ -147,15 +150,16 @@ int main(int argc, char **argv) {
 
   std::string Features = join(MAttrs, ",");
 
-  std::unique_ptr<MCRegisterInfo> MRI(
-      TheTarget->createMCRegInfo(TheTriple.str()));
+  MCTargetOptions MCOptions;
+
+  std::unique_ptr<MCRegisterInfo> MRI(TheTarget->createMCRegInfo(TheTriple));
   if (!MRI) {
     errs() << "No register info for target\n";
     return 1;
   }
 
   std::unique_ptr<MCAsmInfo> MAI(
-      TheTarget->createMCAsmInfo(*MRI, TheTriple.str(), MCTargetOptions()));
+      TheTarget->createMCAsmInfo(*MRI, TheTriple, MCOptions));
   if (!MAI) {
     errs() << "No assembly info for target\n";
     return 1;
@@ -164,10 +168,6 @@ int main(int argc, char **argv) {
   SourceMgr SrcMgr;
   SrcMgr.AddNewSourceBuffer(std::move(In), SMLoc());
 
-  MCObjectFileInfo MOFI;
-  MCContext Ctx(TheTriple, MAI.get(), MRI.get(), &MOFI, &SrcMgr);
-  MOFI.initMCObjectFileInfo(TheTriple, false, Ctx);
-
   std::unique_ptr<MCInstrInfo> MII(TheTarget->createMCInstrInfo());
   if (!MII) {
     errs() << "No instruction info for target\n";
@@ -175,11 +175,17 @@ int main(int argc, char **argv) {
   }
 
   std::unique_ptr<MCSubtargetInfo> STI(
-      TheTarget->createMCSubtargetInfo(TheTriple.str(), MCPU, Features));
+      TheTarget->createMCSubtargetInfo(TheTriple, MCPU, Features));
   if (!STI) {
     errs() << "No subtarget info for target\n";
     return 1;
   }
+
+  MCContext Ctx(TheTriple, MAI.get(), MRI.get(), STI.get(), &SrcMgr,
+                &MCOptions);
+  std::unique_ptr<MCObjectFileInfo> MOFI(
+      TheTarget->createMCObjectFileInfo(Ctx, /*PIC=*/false));
+  Ctx.setObjectFileInfo(MOFI.get());
 
   std::unique_ptr<MCInstPrinter> IP(TheTarget->createMCInstPrinter(
       TheTriple, MAI->getAssemblerDialect(), *MAI, *MII, *MRI));
@@ -191,7 +197,6 @@ int main(int argc, char **argv) {
   AnnotatingStreamer Streamer(Ctx, Out->os(), *IP, *STI);
   std::unique_ptr<MCAsmParser> Parser(
       createMCAsmParser(SrcMgr, Ctx, Streamer, *MAI));
-  MCTargetOptions MCOptions;
   std::unique_ptr<MCTargetAsmParser> TAP(
       TheTarget->createMCAsmParser(*STI, *Parser, *MII, MCOptions));
   if (!TAP) {
