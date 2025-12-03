@@ -302,6 +302,11 @@ public:
     MCStreamer::emitValueImpl(Value, Size, Loc);
   }
 
+  void emitIntValue(uint64_t Value, unsigned Size) override {
+    OS << "DATA: size=" << Size << " expr=" << Value << '\n';
+    MCStreamer::emitIntValue(Value, Size);
+  }
+
   void emitBytes(StringRef Data) override {
     OS << "DATA_BYTES: size=" << Data.size() << " values=" << toHex(Data)
        << '\n';
@@ -319,43 +324,6 @@ public:
                 SMLoc Loc) override {
     OS << "FILL: count=";
     printExpr(&NumValues, OS);
-    OS << " size=" << Size << " value=" << Expr << '\n';
-    MCStreamer::emitFill(NumValues, Size, Expr, Loc);
-  }
-
-  void emitValueToAlignment(Align Alignment, int64_t Value, uint8_t ValueSize,
-                            unsigned MaxBytesToEmit) override {
-    OS << "ALIGN: to=" << Alignment.value() << " fill=" << Value
-       << " size=" << static_cast<unsigned>(ValueSize)
-       << " max=" << MaxBytesToEmit << '\n';
-    MCStreamer::emitValueToAlignment(Alignment, Value, ValueSize,
-                                     MaxBytesToEmit);
-  }
-
-  void emitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) override {
-    OS << "DATA: size=" << Size << " expr=";
-    Value->print(OS, &MAI);
-    OS << '\n';
-    MCStreamer::emitValueImpl(Value, Size, Loc);
-  }
-
-  void emitBytes(StringRef Data) override {
-    OS << "DATA_BYTES: size=" << Data.size() << " values=" << toHex(Data)
-       << '\n';
-    MCStreamer::emitBytes(Data);
-  }
-
-  void emitFill(const MCExpr &NumBytes, uint64_t Value, SMLoc Loc) override {
-    OS << "FILL: count=";
-    NumBytes.print(OS, &MAI);
-    OS << " value=" << Value << '\n';
-    MCStreamer::emitFill(NumBytes, Value, Loc);
-  }
-
-  void emitFill(const MCExpr &NumValues, int64_t Size, int64_t Expr,
-                SMLoc Loc) override {
-    OS << "FILL: count=";
-    NumValues.print(OS, &MAI);
     OS << " size=" << Size << " value=" << Expr << '\n';
     MCStreamer::emitFill(NumValues, Size, Expr, Loc);
   }
