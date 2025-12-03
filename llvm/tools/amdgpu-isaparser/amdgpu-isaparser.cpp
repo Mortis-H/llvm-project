@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCInstPrinter.h"
@@ -31,9 +32,11 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -62,16 +65,194 @@ class AnnotatingStreamer : public MCStreamer {
   raw_ostream &OS;
   MCInstPrinter &InstPrinter;
   const MCSubtargetInfo &STI;
+  const MCAsmInfo &MAI;
 
 public:
   AnnotatingStreamer(MCContext &Ctx, raw_ostream &OS, MCInstPrinter &Printer,
-                     const MCSubtargetInfo &STI)
-      : MCStreamer(Ctx), OS(OS), InstPrinter(Printer), STI(STI) {}
+                     const MCSubtargetInfo &STI, const MCAsmInfo &MAI)
+      : MCStreamer(Ctx), OS(OS), InstPrinter(Printer), STI(STI), MAI(MAI) {}
 
   bool hasRawTextSupport() const override { return true; }
 
+  static StringRef describeAttr(MCSymbolAttr Attribute) {
+    switch (Attribute) {
+    case MCSA_Invalid:
+      return "invalid";
+    case MCSA_ELF_TypeFunction:
+      return "elf_type_function";
+    case MCSA_ELF_TypeIndFunction:
+      return "elf_type_indirect_function";
+    case MCSA_ELF_TypeObject:
+      return "elf_type_object";
+    case MCSA_ELF_TypeTLS:
+      return "elf_type_tls";
+    case MCSA_ELF_TypeCommon:
+      return "elf_type_common";
+    case MCSA_ELF_TypeNoType:
+      return "elf_type_notype";
+    case MCSA_ELF_TypeGnuUniqueObject:
+      return "elf_type_gnu_unique_object";
+    case MCSA_Global:
+      return "global";
+    case MCSA_LGlobal:
+      return "lglobal";
+    case MCSA_Hidden:
+      return "hidden";
+    case MCSA_IndirectSymbol:
+      return "indirect_symbol";
+    case MCSA_Internal:
+      return "internal";
+    case MCSA_LazyReference:
+      return "lazy_reference";
+    case MCSA_Local:
+      return "local";
+    case MCSA_NoDeadStrip:
+      return "no_dead_strip";
+    case MCSA_SymbolResolver:
+      return "symbol_resolver";
+    case MCSA_AltEntry:
+      return "alt_entry";
+    case MCSA_PrivateExtern:
+      return "private_extern";
+    case MCSA_Protected:
+      return "protected";
+    case MCSA_Reference:
+      return "reference";
+    case MCSA_Extern:
+      return "extern";
+    case MCSA_Weak:
+      return "weak";
+    case MCSA_WeakDefinition:
+      return "weak_definition";
+    case MCSA_WeakReference:
+      return "weak_reference";
+    case MCSA_WeakDefAutoPrivate:
+      return "weak_def_can_be_hidden";
+    case MCSA_Cold:
+      return "cold";
+    case MCSA_Exported:
+      return "exported";
+    case MCSA_WeakAntiDep:
+      return "weak_anti_dep";
+    case MCSA_Memtag:
+      return "memtag";
+    }
+    llvm_unreachable("Unhandled symbol attribute");
+  }
+
+  static void printExpr(const MCExpr *Expr, raw_ostream &OS) {
+    auto PrintBinaryOpcode = [](MCBinaryExpr::Opcode Op) {
+      switch (Op) {
+      case MCBinaryExpr::Add:
+        return "+";
+      case MCBinaryExpr::And:
+        return "&";
+      case MCBinaryExpr::Div:
+        return "/";
+      case MCBinaryExpr::EQ:
+        return "==";
+      case MCBinaryExpr::GT:
+        return ">";
+      case MCBinaryExpr::GTE:
+        return ">=";
+      case MCBinaryExpr::LAnd:
+        return "&&";
+      case MCBinaryExpr::LOr:
+        return "||";
+      case MCBinaryExpr::LT:
+        return "<";
+      case MCBinaryExpr::LTE:
+        return "<=";
+      case MCBinaryExpr::Mod:
+        return "%";
+      case MCBinaryExpr::Mul:
+        return "*";
+      case MCBinaryExpr::NE:
+        return "!=";
+      case MCBinaryExpr::Or:
+        return "|";
+      case MCBinaryExpr::OrNot:
+        return "|~";
+      case MCBinaryExpr::Shl:
+        return "<<";
+      case MCBinaryExpr::AShr:
+        return ">>";
+      case MCBinaryExpr::LShr:
+        return ">>>";
+      case MCBinaryExpr::Sub:
+        return "-";
+      case MCBinaryExpr::Xor:
+        return "^";
+      }
+      return "?";
+    };
+
+    switch (Expr->getKind()) {
+    case MCExpr::Constant:
+      OS << cast<MCConstantExpr>(Expr)->getValue();
+      return;
+    case MCExpr::SymbolRef: {
+      const auto *Sym = cast<MCSymbolRefExpr>(Expr);
+      if (Sym->getSpecifier())
+        OS << "spec" << Sym->getSpecifier() << '(';
+      OS << Sym->getSymbol().getName();
+      if (Sym->getSpecifier())
+        OS << ')';
+      return;
+    }
+    case MCExpr::Unary: {
+      const auto *Unary = cast<MCUnaryExpr>(Expr);
+      switch (Unary->getOpcode()) {
+      case MCUnaryExpr::LNot:
+        OS << '!';
+        break;
+      case MCUnaryExpr::Minus:
+        OS << '-';
+        break;
+      case MCUnaryExpr::Not:
+        OS << '~';
+        break;
+      case MCUnaryExpr::Plus:
+        OS << '+';
+        break;
+      }
+      printExpr(Unary->getSubExpr(), OS);
+      return;
+    }
+    case MCExpr::Binary: {
+      const auto *Bin = cast<MCBinaryExpr>(Expr);
+      printExpr(Bin->getLHS(), OS);
+      OS << ' ' << PrintBinaryOpcode(Bin->getOpcode()) << ' ';
+      printExpr(Bin->getRHS(), OS);
+      return;
+    }
+    case MCExpr::Specifier:
+      OS << "<specifier_expr>";
+      return;
+    case MCExpr::Target:
+      OS << "<target_expr>";
+      return;
+    }
+    OS << "<expr>";
+  }
+
   void emitRawTextImpl(StringRef String) override {
     OS << "DIRECTIVE: " << String << '\n';
+  }
+
+  void changeSection(MCSection *Section, uint32_t Subsection) override {
+    OS << "SECTION: " << Section->getName();
+    if (Subsection)
+      OS << " subsection=" << Subsection;
+    OS << '\n';
+    MCStreamer::changeSection(Section, Subsection);
+  }
+
+  void emitAssignment(MCSymbol *Symbol, const MCExpr *Value) override {
+    OS << "ASSIGNMENT: " << Symbol->getName() << " = ";
+    printExpr(Value, OS);
+    OS << '\n';
+    MCStreamer::emitAssignment(Symbol, Value);
   }
 
   void emitInstruction(const MCInst &Inst,
@@ -88,14 +269,67 @@ public:
   }
 
   bool emitSymbolAttribute(MCSymbol *Symbol, MCSymbolAttr Attribute) override {
-    OS << "SYMBOL_ATTR: " << Symbol->getName() << '\n';
-    return true;
+    OS << "SYMBOL_ATTR: " << Symbol->getName()
+       << " attr=" << describeAttr(Attribute) << '\n';
+    return MCStreamer::emitSymbolAttribute(Symbol, Attribute);
   }
 
   void emitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                         Align ByteAlignment) override {
     OS << "COMMON: " << Symbol->getName() << " size=" << Size;
     OS << " align=" << ByteAlignment.value() << '\n';
+    MCStreamer::emitCommonSymbol(Symbol, Size, ByteAlignment);
+  }
+
+  void emitLocalCommonSymbol(MCSymbol *Symbol, uint64_t Size,
+                             Align ByteAlignment) override {
+    OS << "LOCAL_COMMON: " << Symbol->getName() << " size=" << Size;
+    OS << " align=" << ByteAlignment.value() << '\n';
+    MCStreamer::emitLocalCommonSymbol(Symbol, Size, ByteAlignment);
+  }
+
+  void emitELFSize(MCSymbol *Symbol, const MCExpr *Value) override {
+    OS << "SIZE: " << Symbol->getName() << " = ";
+    printExpr(Value, OS);
+    OS << '\n';
+    MCStreamer::emitELFSize(Symbol, Value);
+  }
+
+  void emitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) override {
+    OS << "DATA: size=" << Size << " expr=";
+    printExpr(Value, OS);
+    OS << '\n';
+    MCStreamer::emitValueImpl(Value, Size, Loc);
+  }
+
+  void emitBytes(StringRef Data) override {
+    OS << "DATA_BYTES: size=" << Data.size() << " values=" << toHex(Data)
+       << '\n';
+    MCStreamer::emitBytes(Data);
+  }
+
+  void emitFill(const MCExpr &NumBytes, uint64_t Value, SMLoc Loc) override {
+    OS << "FILL: count=";
+    printExpr(&NumBytes, OS);
+    OS << " value=" << Value << '\n';
+    MCStreamer::emitFill(NumBytes, Value, Loc);
+  }
+
+  void emitFill(const MCExpr &NumValues, int64_t Size, int64_t Expr,
+                SMLoc Loc) override {
+    OS << "FILL: count=";
+    printExpr(&NumValues, OS);
+    OS << " size=" << Size << " value=" << Expr << '\n';
+    MCStreamer::emitFill(NumValues, Size, Expr, Loc);
+  }
+
+  void emitValueToAlignment(Align Alignment, int64_t Value, uint8_t ValueSize,
+                            unsigned MaxBytesToEmit) override {
+    OS << "ALIGN: to=" << Alignment.value() << " fill=" << Value
+       << " size=" << static_cast<unsigned>(ValueSize)
+       << " max=" << MaxBytesToEmit << '\n';
+    MCStreamer::emitValueToAlignment(Alignment, Value, ValueSize,
+                                     MaxBytesToEmit);
   }
 };
 
@@ -194,7 +428,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  AnnotatingStreamer Streamer(Ctx, Out->os(), *IP, *STI);
+  AnnotatingStreamer Streamer(Ctx, Out->os(), *IP, *STI, *MAI);
   std::unique_ptr<MCAsmParser> Parser(
       createMCAsmParser(SrcMgr, Ctx, Streamer, *MAI));
   std::unique_ptr<MCTargetAsmParser> TAP(
