@@ -7,14 +7,18 @@
 //===----------------------------------------------------------------------===//
 //
 // A thin, llvm-mc-inspired frontend that runs the AMDGPU assembler and reports
-// what it sees via a simple, prefixed text stream. Using the MC layer keeps the
-// tool aware of new instructions, directives, and processors without having to
-// hard code line classifications.
+// what it sees. The tool uses the MC layer to stay aware of new instructions,
+// directives, and processors without hard coding classifications.  Instead of
+// streaming events immediately, we now collect labels, instructions, and
+// directives so they can be forwarded to later stages.  For the first phase,
+// the collected data is emitted as structured text.
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
@@ -30,6 +34,7 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCTargetOptions.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/MC/MCTargetStreamer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -41,6 +46,8 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUTargetStreamer.h"
 
 using namespace llvm;
 
@@ -67,10 +74,44 @@ class AnnotatingStreamer : public MCStreamer {
   const MCSubtargetInfo &STI;
   const MCAsmInfo &MAI;
 
+  struct DirectiveRecord {
+    std::string Text;
+  };
+
+  struct LabelRecord {
+    std::string Name;
+  };
+
+  struct InstructionRecord {
+    std::string Text;
+  };
+
+  SmallVector<DirectiveRecord> Directives;
+  SmallVector<LabelRecord> Labels;
+  SmallVector<InstructionRecord> Instructions;
+
 public:
   AnnotatingStreamer(MCContext &Ctx, raw_ostream &OS, MCInstPrinter &Printer,
                      const MCSubtargetInfo &STI, const MCAsmInfo &MAI)
       : MCStreamer(Ctx), OS(OS), InstPrinter(Printer), STI(STI), MAI(MAI) {}
+
+  void recordDirective(StringRef Text) { Directives.push_back({Text.str()}); }
+
+  static std::string renderInst(const MCInst &Inst, MCInstPrinter &Printer,
+                                const MCSubtargetInfo &STI) {
+    std::string Buffer;
+    raw_string_ostream OS(Buffer);
+    Printer.printInst(&Inst, 0, "", STI, OS);
+    return OS.str();
+  }
+
+  static std::string renderExpr(const MCExpr *Expr) {
+    std::string Buffer;
+    raw_string_ostream OS(Buffer);
+    printExpr(Expr, OS);
+    OS.flush();
+    return Buffer;
+  }
 
   bool hasRawTextSupport() const override { return true; }
 
@@ -237,104 +278,168 @@ public:
   }
 
   void emitRawTextImpl(StringRef String) override {
-    OS << "DIRECTIVE: " << String << '\n';
+    recordDirective(String);
   }
 
   void changeSection(MCSection *Section, uint32_t Subsection) override {
-    OS << "SECTION: " << Section->getName();
-    if (Subsection)
-      OS << " subsection=" << Subsection;
-    OS << '\n';
+    recordDirective((Twine(".section ") + Section->getName() +
+                    (Subsection ? (Twine(" subsection=") + Twine(Subsection))
+                                 : Twine("")))
+                       .str());
     MCStreamer::changeSection(Section, Subsection);
   }
 
   void emitAssignment(MCSymbol *Symbol, const MCExpr *Value) override {
-    OS << "ASSIGNMENT: " << Symbol->getName() << " = ";
-    printExpr(Value, OS);
-    OS << '\n';
+    recordDirective(
+        (Twine(".set ") + Symbol->getName() + ", " + renderExpr(Value))
+            .str());
     MCStreamer::emitAssignment(Symbol, Value);
   }
 
   void emitInstruction(const MCInst &Inst,
                        const MCSubtargetInfo &STI) override {
-    OS << "INSTRUCTION: ";
-    InstPrinter.printInst(&Inst, 0, "", STI, OS);
-    OS << '\n';
+    Instructions.push_back({renderInst(Inst, InstPrinter, STI)});
     MCStreamer::emitInstruction(Inst, STI);
   }
 
   void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc()) override {
-    OS << "LABEL: " << Symbol->getName() << '\n';
+    Labels.push_back({Symbol->getName().str()});
     MCStreamer::emitLabel(Symbol, Loc);
   }
 
   bool emitSymbolAttribute(MCSymbol *Symbol, MCSymbolAttr Attribute) override {
-    OS << "SYMBOL_ATTR: " << Symbol->getName()
-       << " attr=" << describeAttr(Attribute) << '\n';
+    recordDirective((Twine(".type ") + Symbol->getName() + ", " +
+                     describeAttr(Attribute))
+                        .str());
     return MCStreamer::emitSymbolAttribute(Symbol, Attribute);
   }
 
   void emitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                         Align ByteAlignment) override {
-    OS << "COMMON: " << Symbol->getName() << " size=" << Size;
-    OS << " align=" << ByteAlignment.value() << '\n';
+    recordDirective((Twine(".comm ") + Symbol->getName() + ", " + Twine(Size) +
+                     ", " + Twine(ByteAlignment.value()))
+                        .str());
     MCStreamer::emitCommonSymbol(Symbol, Size, ByteAlignment);
   }
 
   void emitLocalCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                              Align ByteAlignment) override {
-    OS << "LOCAL_COMMON: " << Symbol->getName() << " size=" << Size;
-    OS << " align=" << ByteAlignment.value() << '\n';
+    recordDirective((Twine(".lcomm ") + Symbol->getName() + ", " + Twine(Size) +
+                     ", " + Twine(ByteAlignment.value()))
+                        .str());
     MCStreamer::emitLocalCommonSymbol(Symbol, Size, ByteAlignment);
   }
 
   void emitELFSize(MCSymbol *Symbol, const MCExpr *Value) override {
-    OS << "SIZE: " << Symbol->getName() << " = ";
-    printExpr(Value, OS);
-    OS << '\n';
+    recordDirective(
+        (Twine(".size ") + Symbol->getName() + ", " + renderExpr(Value))
+            .str());
     MCStreamer::emitELFSize(Symbol, Value);
   }
 
   void emitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) override {
-    OS << "DATA: size=" << Size << " expr=";
-    printExpr(Value, OS);
-    OS << '\n';
+    recordDirective((Twine(".data_value size=") + Twine(Size) +
+                     " expr=" + renderExpr(Value))
+                        .str());
     MCStreamer::emitValueImpl(Value, Size, Loc);
   }
 
   void emitIntValue(uint64_t Value, unsigned Size) override {
-    OS << "DATA: size=" << Size << " expr=" << Value << '\n';
+    recordDirective((Twine(".data_int size=") + Twine(Size) + " expr=" +
+                     Twine(Value))
+                        .str());
     MCStreamer::emitIntValue(Value, Size);
   }
 
   void emitBytes(StringRef Data) override {
-    OS << "DATA_BYTES: size=" << Data.size() << " values=" << toHex(Data)
-       << '\n';
+    recordDirective((Twine(".bytearray size=") + Twine(Data.size()) +
+                     " values=" + toHex(Data))
+                        .str());
     MCStreamer::emitBytes(Data);
   }
 
   void emitFill(const MCExpr &NumBytes, uint64_t Value, SMLoc Loc) override {
-    OS << "FILL: count=";
-    printExpr(&NumBytes, OS);
-    OS << " value=" << Value << '\n';
+    recordDirective((Twine(".fill ") + renderExpr(&NumBytes) + " value=" +
+                     Twine(Value))
+                        .str());
     MCStreamer::emitFill(NumBytes, Value, Loc);
   }
 
   void emitFill(const MCExpr &NumValues, int64_t Size, int64_t Expr,
                 SMLoc Loc) override {
-    OS << "FILL: count=";
-    printExpr(&NumValues, OS);
-    OS << " size=" << Size << " value=" << Expr << '\n';
+    recordDirective((Twine(".fill ") + renderExpr(&NumValues) +
+                     " size=" + Twine(Size) + " value=" + Twine(Expr))
+                        .str());
     MCStreamer::emitFill(NumValues, Size, Expr, Loc);
   }
 
   void emitValueToAlignment(Align Alignment, int64_t Value, uint8_t ValueSize,
                             unsigned MaxBytesToEmit) override {
-    OS << "ALIGN: to=" << Alignment.value() << " fill=" << Value
-       << " size=" << static_cast<unsigned>(ValueSize)
-       << " max=" << MaxBytesToEmit << '\n';
+    recordDirective((Twine(".align ") + Twine(Alignment.value()) +
+                     " fill=" + Twine(Value) + " size=" +
+                     Twine(static_cast<unsigned>(ValueSize)) +
+                     " max=" + Twine(MaxBytesToEmit))
+                        .str());
     MCStreamer::emitValueToAlignment(Alignment, Value, ValueSize,
                                      MaxBytesToEmit);
+  }
+
+  void writeReport() {
+    OS << "# Directives\n";
+    for (const auto &Directive : Directives)
+      OS << "DIRECTIVE: " << Directive.Text << '\n';
+
+    OS << "\n# Labels\n";
+    for (const auto &Label : Labels)
+      OS << "LABEL: " << Label.Name << '\n';
+
+    OS << "\n# Instructions\n";
+    for (const auto &Instruction : Instructions)
+      OS << "INSTRUCTION: " << Instruction.Text << '\n';
+  }
+};
+
+class RecordingAMDGPUTargetStreamer : public AMDGPUTargetStreamer {
+  AnnotatingStreamer &Recorder;
+
+public:
+  explicit RecordingAMDGPUTargetStreamer(AnnotatingStreamer &Recorder)
+      : AMDGPUTargetStreamer(Recorder), Recorder(Recorder) {}
+
+  void EmitDirectiveAMDGCNTarget() override {
+    AMDGPUTargetStreamer::EmitDirectiveAMDGCNTarget();
+
+    std::string Target =
+        getTargetID() ? (Twine(".amdgcn_target \"") +
+                              getTargetID()->toString() + "\"")
+                             .str()
+                      : std::string(".amdgcn_target");
+    Recorder.recordDirective(Target);
+  }
+
+  void EmitDirectiveAMDHSACodeObjectVersion(unsigned COV) override {
+    AMDGPUTargetStreamer::EmitDirectiveAMDHSACodeObjectVersion(COV);
+    Recorder.recordDirective(
+        (Twine(".amdhsa_code_object_version ") + Twine(COV)).str());
+  }
+
+  void emitAMDGPULDS(MCSymbol *Symbol, unsigned Size,
+                     Align Alignment) override {
+    Recorder.recordDirective((Twine(".amdgpu_lds ") + Symbol->getName() +
+                             ", " + Twine(Size) + ", " +
+                             Twine(Alignment.value()))
+                                .str());
+  }
+
+  void EmitAMDGPUSymbolType(StringRef SymbolName, unsigned Type) override {
+    if (Type == ELF::STT_AMDGPU_HSA_KERNEL) {
+      Recorder.recordDirective((Twine(".amdgpu_hsa_kernel ") + SymbolName).str());
+      return;
+    }
+
+    Recorder.recordDirective((Twine(".amdgpu_symbol_type ") + SymbolName +
+                             " type=" + Twine(Type))
+                                .str());
   }
 };
 
@@ -434,6 +539,8 @@ int main(int argc, char **argv) {
   }
 
   AnnotatingStreamer Streamer(Ctx, Out->os(), *IP, *STI, *MAI);
+  Streamer.setTargetStreamer(new RecordingAMDGPUTargetStreamer(Streamer));
+
   std::unique_ptr<MCAsmParser> Parser(
       createMCAsmParser(SrcMgr, Ctx, Streamer, *MAI));
   std::unique_ptr<MCTargetAsmParser> TAP(
@@ -456,6 +563,7 @@ int main(int argc, char **argv) {
   if (Parser->Run(false))
     return 1;
 
+  Streamer.writeReport();
   Out->keep();
   return 0;
 }
