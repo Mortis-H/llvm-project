@@ -58,6 +58,10 @@ Potentially Breaking Changes
   :program:`clang-tidy-20`. Users should use the check-specific options of the
   same name instead.
 
+- Removed `clang-analyzer-*` checks from default checks in :program:`clang-tidy`.
+  From now on, users should specify explicitly that they want CSA checks to run
+  in :program:`clang-tidy` via `clang-analyzer-*`.
+
 - Renamed a few :program:`clang-tidy` check options, as they
   were misspelled:
 
@@ -183,6 +187,10 @@ Improvements to clang-tidy
 - Improved :program:`run-clang-tidy.py` and :program:`clang-tidy-diff.py`
   scripts by adding the `-hide-progress` option to suppress progress and
   informational messages.
+
+- Removed `clang-analyzer-*` check from default checks in :program:`clang-tidy`.
+  From now on, users should specify explicitly that they want CSA checks to run
+  in :program:`clang-tidy`.
 
 - Deprecated the :program:`clang-tidy` ``zircon`` module. All checks have been
   moved to the ``fuchsia`` module instead. The ``zircon`` module will be removed
@@ -549,6 +557,11 @@ Changes in existing checks
   <clang-tidy/checks/readability/implicit-bool-conversion>` check by correctly
   adding parentheses when the inner expression are implicitly converted
   multiple times.
+
+- Improved :doc:`readability-inconsistent-declaration-parameter-name
+  <clang-tidy/checks/readability/inconsistent-declaration-parameter-name>` check
+  by not enforcing parameter name consistency between a variadic parameter pack
+  in the primary template and specific parameters in its specializations.
 
 - Improved :doc:`readability-qualified-auto
   <clang-tidy/checks/readability/qualified-auto>` check by adding the option
